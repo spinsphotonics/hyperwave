@@ -27,19 +27,21 @@ def get(field: ArrayLike, offset: Int3, shape: Int3):
     ]
 
 
-def check_problem_inputs(
+def problem_shape(
     grid: Grid,
     permittivity: ArrayLike,
     conductivity: ArrayLike,
     source_field: Subfield,
-):
+) -> Int3:
+    """``(xx, yy, zz)`` of problem domain."""
+    shape = tuple(du.shape[0] for du in grid.du)
+
     if not all(du.ndim == 2 and du.shape[1] == 2 for du in grid.du):
         raise ValueError(
             f"grid spacings must be of shape ``[:, 2]`` but got shapes of "
             f"{grid.dx.shape}, {grid.dy.shape}, and {grid.dz.shape} instead."
         )
 
-    shape = tuple(du.shape[0] for du in grid.du)
     if permittivity.shape[-3:] != shape or conductivity.shape[-3:] != shape:
         raise ValueError(
             f"Permittivity and conductivity arrays must match grid shape of "
@@ -57,3 +59,5 @@ def check_problem_inputs(
             f"shape of {source_field.field.shape} with a problem domain of "
             f"shape {shape}"
         )
+
+    return shape

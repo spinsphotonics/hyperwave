@@ -11,17 +11,17 @@ from .typing import Band
 
 def project(
     snapshots: ArrayLike,
-    omegas: ArrayLike,
+    freq_band: Band,
     t: ArrayLike,
 ) -> jax.Array:
-    """Project ``snapshots`` at ``t`` to angular frequencies ``omegas``."""
+    """Project ``snapshots`` at ``t`` to ``freq_band`` frequencies."""
     # Build ``P`` matrix.
-    wt = omegas[None, :] * t[:, None]
+    wt = freq_band.values[None, :] * t[:, None]
     P = jnp.concatenate([jnp.cos(wt), -jnp.sin(wt)], axis=1)
 
     # Project out frequency components.
     res = jnp.einsum("ij,j...->i...", jnp.linalg.inv(P), snapshots)
-    return res[: len(omegas)] + 1j * res[len(omegas) :]
+    return res[: freq_band.num] + 1j * res[freq_band.num :]
 
 
 def sampling_interval(freq_band: Band) -> float:

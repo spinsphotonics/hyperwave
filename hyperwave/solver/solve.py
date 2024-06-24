@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 from . import fdtd, grids, sampling, utils
-from .typing import Band, Grid, Range, Subfield, Volume
+from .typing import Band, Grid, Int3, Range, Subfield, Volume
 
 
 def solve(
@@ -101,56 +101,29 @@ def solve(
         * ``num_steps`` is the number of time-domain updates executed.
 
     """
-    utils.check_problem_inputs(grid, permittivity, conductivity, source)
-    shape = permittivity.shape[-3:]  # TODO: Do better.
+    shape = utils.problem_shape(grid, permittivity, conductivity, source)
+    dt, sample_every_n = sampling_strategy(freq_band, permittivity)
+    steps_per_sim = simulation_steps(freq_band, sample_every_n, shape)
 
-    omegas = freq_band.values
-    sampling_interval = sampling.sampling_interval(freq_band)
-
-    # Steps to sample against.
-    dt = 0.99 * jnp.min(permittivity) / jnp.sqrt(3)
-    if len(omegas) > 1:  # Adjust dt.
-        n = int(jnp.floor(sampling_interval / dt))
-        dt = sampling_interval / (n + 1)
-        sample_every_n_steps = n + 1
-    else:
-        sample_every_n_steps = int(round(sampling_interval / dt))
-    sample_steps = sample_every_n_steps * (2 * len(omegas) - 1) + 1
-
-    # Heuristic for determining the number of steps to simulate for, before
-    # checking for the termination condition.
-
-    # TODO: Think about how long to run the simulation.
-    min_sim_steps_heuristic = sum(shape)  # TODO: Move constant.
-
-    # Actual number of steps to simulate.
-    steps_per_sim = max(min_sim_steps_heuristic, sample_steps)
-    # steps_per_sim = sample_steps
-
-    # Reset ``max_steps`` for what the actual maximum number of steps will be.
-    if max_steps % steps_per_sim != 0:
-        max_steps = max_steps + steps_per_sim - (max_steps % steps_per_sim)
-
-    # # TODO: Do something for phases here.
-    # phases = -1 * jnp.pi * jnp.arange(len(omegas))
-
-    # src = source.as_fdtd(omegas, dt * jnp.arange(max_steps))  # TODO: +1 for max_steps?
-    phases = -1 * jnp.pi * jnp.arange(len(omegas))
+    # Phase stuff.
+    phases = -1 * jnp.pi * jnp.arange(freq_band.num)
     t = jnp.arange(max_steps) * dt
-    phi = omegas[:, None] * t + phases[:, None]
+    phi = freq_band.values[:, None] * t + phases[:, None]
     waveform = jnp.sum(jnp.exp(1j * phi), axis=0)
 
-    # Initial values.
-    e_field, h_field = 2 * [jnp.zeros_like(permittivity)]
-
+    # Initial stuff.
     state = None
-    output_volumes = [Volume(offset=(0, 0, 0), shape=shape)]
+    if output_volumes is None:
+        output_volumes = [Volume(offset=(0, 0, 0), shape=shape)]
+
     # TODO: Can we change this into a jax loop?
     for start_step in range(0, max_steps, steps_per_sim):
         snapshot_range = Range(
-            start=start_step + steps_per_sim - sample_steps,
-            interval=sample_every_n_steps,
-            num=2 * len(omegas),
+            start=start_step
+            + steps_per_sim
+            - total_sampling_steps(freq_band, sample_every_n),
+            interval=sample_every_n,
+            num=2 * freq_band.num,
         )
 
         # Run simulation.
@@ -159,7 +132,6 @@ def solve(
             grid=grid,
             permittivity=permittivity,
             conductivity=conductivity,
-            # source=src,
             source_field=source,
             source_waveform=waveform,
             output_volumes=output_volumes,
@@ -174,7 +146,7 @@ def solve(
             + snapshot_range.start
             + snapshot_range.interval * jnp.arange(snapshot_range.num)
         )
-        freq_fields = sampling.project(outs[0], omegas, t)
+        freq_fields = sampling.project(outs[0], freq_band, t)
 
         # Undo phase changes
         freq_fields *= jnp.expand_dims(
@@ -182,10 +154,9 @@ def solve(
         )
 
         # Compute error.
-        errs, err_fields = wave_equation_error(
+        errs = wave_equation_error(
             fields=freq_fields,
             freq_band=freq_band,
-            # source_phase=phases,
             permittivity=permittivity,
             conductivity=conductivity,
             source=source,
@@ -193,9 +164,9 @@ def solve(
         )
 
         if jnp.max(errs) < err_thresh:
-            return (freq_fields, errs, start_step + steps_per_sim)
+            break
 
-    return (freq_fields, errs, max_steps)
+    return (freq_fields, errs, start_step + steps_per_sim)
 
 
 def wave_equation_error(
@@ -223,18 +194,75 @@ def wave_equation_error(
         corresponding to the solutions fields in ``fields``.
 
     """
-    omegas = freq_band.values
-    w = jnp.expand_dims(omegas, axis=range(-4, 0))
-    # phi = jnp.expand_dims(source_phase, axis=range(-4, 0))
-    err = (
-        grids.curl(grids.curl(fields, grid, is_forward=True), grid, is_forward=False)
-        - w**2 * (permittivity - 1j * conductivity / w) * fields
-        # + 1j * w * source * jnp.exp(1j * phi)
+    shape = utils.problem_shape(grid, permittivity, conductivity, source)
+    w = jnp.expand_dims(freq_band.values, axis=range(-4, 0))
+
+    def operator(u):
+        return (
+            grids.curl(grids.curl(u, grid, is_forward=True), grid, is_forward=False)
+            - (w**2) * (permittivity - 1j * conductivity / w) * u
+        )
+
+    def norm(u):
+        return jnp.sqrt(jnp.sum(jnp.abs(u) ** 2, axis=range(-4, 0)))
+
+    src = 1j * w * source.field
+    err = utils.at(operator(fields), source.offset, source.field.shape[-3:]).add(src)
+    return norm(err) / norm(src) / jnp.sqrt(3 * shape[0] * shape[1] * shape[2])
+
+
+def sampling_strategy(freq_band: Band, permittivity: ArrayLike) -> Tuple(float, int):
+    """``(dt, sample_every_n)`` simulation update/extraction parameters."""
+
+    sampling_interval = sampling.sampling_interval(freq_band)
+
+    # Determine the time step to be just under the Courant condition.
+    dt = 0.99 * jnp.min(permittivity) / jnp.sqrt(3)
+
+    if freq_band.num == 1:
+        # For a single frequency, no need to adjust ``dt``.
+        sample_every_n = int(round(sampling_interval / dt))
+    else:
+        # In the multi-frequency case, adjust ``dt`` to hit
+        # ``sampling_interval`` exactly. We do this by reducing ``dt`` to be an
+        # integer fraction of  ``sampling_interval``.
+        n = int(jnp.floor(sampling_interval / dt))
+        dt = sampling_interval / (n + 1)
+        sample_every_n = n + 1
+
+    return dt, sample_every_n
+
+
+def total_sampling_steps(freq_band: Band, sample_every_n: int) -> int:
+    """Total number of simulation updates needed to complete sampling."""
+    return 2 * sample_every_n * (freq_band.num - 1)
+
+
+def snapshot_range(
+    start_step: int, steps_per_sim: int, freq_band: Band, sample_every_n: int
+) -> Range:
+    """``Range`` of snapshot times for simulation starting on ``start_step``."""
+    return Range(
+        start=start_step
+        + steps_per_sim
+        - total_sampling_steps(freq_band, sample_every_n),
+        interval=sample_every_n,
+        num=2 * freq_band.num,
     )
-    err = utils.at(err, source.offset, source.field.shape[-3:]).add(
-        1j * w * source.field  # * jnp.exp(1j * phi)
+
+
+def simulation_steps(
+    freq_band: Band,
+    sample_every_n: int,
+    shape: Int3,
+    min_traversals: float = 10.0,
+) -> int:
+    """Suggested length of simulations executed in ``solve()``."""
+    return max(
+        # Number of time steps needed to complete the sampling protocol.
+        total_sampling_steps(freq_band, sample_every_n),
+        # Allow for ``min_traversals`` bounces along the maximum dimension of
+        # the simulation domain, using the crude approximation of traveling a
+        # single cell per update step.
+        int(min_traversals * max(shape)),
     )
-    return (
-        jnp.sqrt(jnp.sum(jnp.abs(err) ** 2, axis=(1, 2, 3, 4)))
-        / (omegas * jnp.linalg.norm(source.field))
-    ), err
