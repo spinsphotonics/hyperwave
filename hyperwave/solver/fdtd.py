@@ -162,6 +162,7 @@ def simulate(
         state, outs, output_index=0, num_steps=snapshot_range.start - state.step
     )
 
+    # TODO: Jaxify this for-loop as well?
     # Materialize the rest of the output snapshots.
     for output_index in range(1, snapshot_range.num):
         state, outs = update_and_output(

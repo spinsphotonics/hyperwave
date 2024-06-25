@@ -107,7 +107,7 @@ def solve(
 
     # Phase stuff.
     phases = -1 * jnp.pi * jnp.arange(freq_band.num)
-    t = jnp.arange(max_steps) * dt
+    t = jnp.arange(2 * max_steps) * dt  # TODO: Fix
     phi = freq_band.values[:, None] * t + phases[:, None]
     waveform = jnp.sum(jnp.exp(1j * phi), axis=0)
 
@@ -117,7 +117,7 @@ def solve(
         output_volumes = [Volume(offset=(0, 0, 0), shape=shape)]
 
     # TODO: Can we change this into a jax loop?
-    for start_step in range(0, max_steps, steps_per_sim):
+    for start_step in range(-1, max_steps, steps_per_sim):
         snapshot_range = Range(
             start=start_step
             + steps_per_sim
@@ -125,6 +125,16 @@ def solve(
             interval=sample_every_n,
             num=2 * freq_band.num,
         )
+        # wvfrm = waveform
+        snapshot_range = Range(
+            start=-1,
+            interval=sample_every_n,
+            num=2 * freq_band.num,
+        )
+        if state is not None:
+            state = fdtd.State(step=-1, e_field=state.e_field, h_field=state.h_field)
+
+        wvfrm = waveform[start_step + 1 :]
 
         # Run simulation.
         state, outs = fdtd.simulate(
@@ -133,7 +143,7 @@ def solve(
             permittivity=permittivity,
             conductivity=conductivity,
             source_field=source,
-            source_waveform=waveform,
+            source_waveform=wvfrm,  # waveform,
             output_volumes=output_volumes,
             snapshot_range=snapshot_range,
             state=state,
@@ -143,7 +153,8 @@ def solve(
         # TODO: Generalize beyond 1st output.
         t = dt * (
             0.5
-            + snapshot_range.start
+            + start_step
+            # + snapshot_range.start
             + snapshot_range.interval * jnp.arange(snapshot_range.num)
         )
         freq_fields = sampling.project(outs[0], freq_band, t)
@@ -162,6 +173,7 @@ def solve(
             source=source,
             grid=grid,
         )
+        print(f"{errs}, {start_step}, {state.step}, {snapshot_range}")
 
         if jnp.max(errs) < err_thresh:
             break
@@ -235,7 +247,7 @@ def sampling_strategy(freq_band: Band, permittivity: ArrayLike) -> Tuple(float, 
 
 def total_sampling_steps(freq_band: Band, sample_every_n: int) -> int:
     """Total number of simulation updates needed to complete sampling."""
-    return 2 * sample_every_n * (freq_band.num - 1)
+    return sample_every_n * (2 * freq_band.num - 1)
 
 
 def snapshot_range(
@@ -255,7 +267,7 @@ def simulation_steps(
     freq_band: Band,
     sample_every_n: int,
     shape: Int3,
-    min_traversals: float = 10.0,
+    min_traversals: float = 1.0,
 ) -> int:
     """Suggested length of simulations executed in ``solve()``."""
     return max(

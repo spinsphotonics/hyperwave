@@ -77,8 +77,8 @@ def test_solve_invalid_inputs():
 
 def test_solve_convergences_for_simple_problem(
     shape=(100, 10, 10),
-    err_thresh=1e-4,
-    max_steps=10_000,
+    err_thresh=1e-6,
+    max_steps=20_000,
     freq_band=hw.solver.Band(2 * jnp.pi / 20.0, 2 * jnp.pi / 16.0, 20),
 ):
     xx, yy, zz = shape
