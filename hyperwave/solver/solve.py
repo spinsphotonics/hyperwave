@@ -11,6 +11,11 @@ from jax.typing import ArrayLike
 from . import fdtd, grids, sampling, utils
 from .typing import Band, Grid, Int3, Range, Subfield, Volume
 
+# TODO: Need to support the following use cases.
+# - exploratory: try hard to reduce error, find minimal
+# - direct-with-error: I'm pretty sure I know how many steps are needed, just do that?
+# - direct-with-no-error: Don't compute error.
+
 
 def solve(
     grid: Grid,
@@ -262,7 +267,7 @@ def snapshot_strategy(
     freq_band: Band,
     sample_every_n: int,
     shape: Int3,
-    min_traversals: float = 10.0,
+    min_traversals: float = 100.0,
 ) -> Range:
     """Suggested length of simulations executed in ``solve()``."""  # TODO: Change.
     steps_per_sim = max(
