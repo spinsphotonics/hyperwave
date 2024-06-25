@@ -188,7 +188,7 @@ def solve(
         cond_fn, body_fn, init_foo
     )
     print(f"{errs}, {start_step}, {state.step}, {snapshot_range}")
-    return (freq_fields, errs, start_step + steps_per_sim)
+    return (freq_fields, errs, start_step)
 
     # TODO: Can we change this into a jax loop?
     for start_step in range(-1, max_steps, steps_per_sim):
