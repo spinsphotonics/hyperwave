@@ -114,15 +114,16 @@ def simulate(
         ``nn`` as the number of snapshots as given by ``snapshot_range.num``.
 
     """
-
-    # TODO: Check for compatibility between ``snapshot_range`` and ``(tt,)`` from ``source_waveform``.
-
-    # TODO: Also make sure ``snapshot_range`` is legit.
-
+    # Validate inputs.
     shape = utils.problem_shape(grid, permittivity, conductivity, source_field)
-
-    if state is None:
-        state = State.default(shape)
+    if snapshot_range.start < -1 or snapshot_range.stop != len(source_waveform):
+        raise ValueError(
+            f"``snapshot_range`` must start after index ``-1`` and must have "
+            f"final value corresponding to the last index of "
+            f"``source_waveform``, but got got a ``snapshot_range`` of "
+            f"{snapshot_range} and ``source_waveform`` of shape "
+            f"{source_waveform.shape}."
+        )
 
     # Precomputed update coefficients
     z = conductivity * dt / (2 * permittivity)
@@ -163,48 +164,30 @@ def simulate(
     def update_and_output_for_loop_body(
         output_index: int, state_and_outs: Tuple[State, Outputs]
     ) -> Tuple[State, Outputs]:
-        """For output indices >= 1"""  # TODO: Improve.
+        """``update_and_output()`` for ``output_index >= 1``."""
         return update_and_output(
             *state_and_outs,
             output_index,
-            lower=snapshot_range.start
-            + (output_index - 1) * snapshot_range.interval
-            + 1,
-            upper=snapshot_range.start + output_index * snapshot_range.interval + 1,
+            lower=snapshot_range[output_index - 1] + 1,
+            upper=snapshot_range[output_index] + 1,
         )
 
-    # TODO: Remove.
-    # # Initialize initial state and outputs.
-    # if state is None:
-    #     state = State(
-    #         step=-1,
-    #         e_field=jnp.zeros((3,) + grids.shape(grid)),
-    #         h_field=jnp.zeros((3,) + grids.shape(grid)),
-    #     )
-
+    # Initialize ``state`` and ``outs``.
+    if state is None:
+        state = State.default(shape)
     outs = tuple(jnp.empty((snapshot_range.num, 3) + ov.shape) for ov in output_volumes)
 
     # Initial update to first output.
     state, outs = update_and_output(
-        state, outs, output_index=0, lower=0, upper=snapshot_range.start + 1
+        state, outs, output_index=0, lower=0, upper=snapshot_range[0] + 1
     )
 
-    # TODO: Change this to ``jax.lax.scan``.
+    # Materialize remaining outputs.
     state, outs = jax.lax.fori_loop(
         lower=1,
         upper=snapshot_range.num,
         body_fun=update_and_output_for_loop_body,
         init_val=(state, outs),
     )
-    # # TODO: Jaxify this for-loop as well?
-    # # Materialize the rest of the output snapshots.
-    # for i in range(1, snapshot_range.num):
-    #     state, outs = update_and_output(
-    #         state,
-    #         outs,
-    #         output_index=i,
-    #         lower=snapshot_range.start + (i - 1) * snapshot_range.interval + 1,
-    #         upper=snapshot_range.start + i * snapshot_range.interval + 1,
-    #     )
 
     return state, outs

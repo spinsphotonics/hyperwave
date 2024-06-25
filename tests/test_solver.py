@@ -155,8 +155,8 @@ def test_fdtd_simulation():
         interval=2,
         num=3,
     )
-    num_steps = snapshot_range.start + snapshot_range.interval * (
-        snapshot_range.num - 1
+    num_steps = (
+        snapshot_range.start + snapshot_range.interval * (snapshot_range.num - 1) + 1
     )
     state, outs = hw.solver.simulate(
         dt=1.0,

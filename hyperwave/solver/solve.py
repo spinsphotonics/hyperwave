@@ -103,42 +103,25 @@ def solve(
     """
     shape = utils.problem_shape(grid, permittivity, conductivity, source)
     dt, sample_every_n = sampling_strategy(freq_band, permittivity)
-    steps_per_sim = simulation_steps(freq_band, sample_every_n, shape)
+    snapshot_range = snapshot_strategy(freq_band, sample_every_n, shape)
 
-    # # TODO: Remove.
-    # # Phase stuff.
-    # phases = -1 * jnp.pi * jnp.arange(freq_band.num)
-    # t = jnp.arange(2 * max_steps) * dt  # TODO: Fix
-    # phi = freq_band.values[:, None] * t + phases[:, None]
-    # waveform = jnp.sum(jnp.exp(1j * phi), axis=0)
-
-    # Initial stuff.
-    state = fdtd.State(  # TODO: Reconcile with fdtd.simulate() way of doing init state.
-        # step=-1,
-        e_field=jnp.zeros((3,) + shape),
-        h_field=jnp.zeros((3,) + shape),
-    )
+    # TODO: Remove.
     if output_volumes is None:
         output_volumes = [Volume(offset=(0, 0, 0), shape=shape)]
 
-    snapshot_range = Range(
-        start=-1,
-        interval=sample_every_n,
-        num=2 * freq_band.num,
-    )
+    def cond_fn(state_and_result):
+        """Terminate on either error or iteration thresholds."""
+        _, (_, errs, num_steps) = state_and_result
+        return jnp.logical_and(jnp.max(errs) > err_thresh, num_steps < max_steps)
 
-    def cond_fn(foo):
-        start_step, _, _, errs = foo
-        return jnp.logical_and(jnp.max(errs) > err_thresh, start_step < max_steps)
-
-    def body_fn(foo):
-        start_step, state, _, _ = foo
-        state = fdtd.State(e_field=state.e_field, h_field=state.h_field)  # step=-1,
+    def body_fn(state_and_result):
+        """Run simulation and extract time-harmonic fields."""
+        state, (_, _, num_steps) = state_and_result
 
         phases = -1 * jnp.pi * jnp.arange(freq_band.num)
 
         # Generate source waveform.
-        t = (start_step + 1 + jnp.arange(steps_per_sim)) * dt  # TODO: Fix
+        t = (num_steps + jnp.arange(snapshot_range.stop)) * dt  # TODO: Fix
         phi = freq_band.values[:, None] * t + phases[:, None]
         wvfrm = jnp.sum(jnp.exp(1j * phi), axis=0)
 
@@ -156,9 +139,12 @@ def solve(
         )
 
         # Infer time-harmonic fields.
-        # TODO: Generalize beyond 1st output.
+        # TODO: Connect with the source generation.
         t = dt * (
-            0.5 + start_step + snapshot_range.interval * jnp.arange(snapshot_range.num)
+            0.5
+            + num_steps
+            - 1
+            + snapshot_range.interval * jnp.arange(snapshot_range.num)
         )
         freq_fields = sampling.project(outs[0], freq_band, t)
 
@@ -169,91 +155,30 @@ def solve(
 
         # Compute error.
         errs = wave_equation_error(
-            fields=freq_fields,
+            grid=grid,
             freq_band=freq_band,
             permittivity=permittivity,
             conductivity=conductivity,
             source=source,
-            grid=grid,
-        )
-
-        start_step += steps_per_sim
-
-        return start_step, state, freq_fields, errs
-        # print(f"{errs}, {start_step}, {state.step}, {snapshot_range}")
-
-    init_foo = (
-        -1,
-        state,
-        jnp.zeros((freq_band.num, 3) + shape, dtype=jnp.complex64),
-        jnp.inf * jnp.ones((freq_band.num)),
-    )
-    start_step, state, freq_fields, errs = jax.lax.while_loop(
-        cond_fn, body_fn, init_foo
-    )
-    print(f"{errs}, {start_step}, {snapshot_range}")
-    return (freq_fields, errs, start_step)
-
-    # TODO: Can we change this into a jax loop?
-    for start_step in range(-1, max_steps, steps_per_sim):
-        # snapshot_range = Range(
-        #     start=start_step
-        #     + steps_per_sim
-        #     - total_sampling_steps(freq_band, sample_every_n),
-        #     interval=sample_every_n,
-        #     num=2 * freq_band.num,
-        # )
-        # wvfrm = waveform
-
-        # wvfrm = waveform[start_step + 1 :]
-        # Phase stuff.
-        phases = -1 * jnp.pi * jnp.arange(freq_band.num)
-        t = (start_step + 1 + jnp.arange(steps_per_sim)) * dt  # TODO: Fix
-        phi = freq_band.values[:, None] * t + phases[:, None]
-        wvfrm = jnp.sum(jnp.exp(1j * phi), axis=0)
-
-        state = fdtd.State(step=-1, e_field=state.e_field, h_field=state.h_field)
-
-        # Run simulation.
-        state, outs = fdtd.simulate(
-            dt=dt,
-            grid=grid,
-            permittivity=permittivity,
-            conductivity=conductivity,
-            source_field=source,
-            source_waveform=wvfrm,  # waveform,
-            output_volumes=output_volumes,
-            snapshot_range=snapshot_range,
-            state=state,
-        )
-
-        # Infer time-harmonic fields.
-        # TODO: Generalize beyond 1st output.
-        t = dt * (
-            0.5 + start_step + snapshot_range.interval * jnp.arange(snapshot_range.num)
-        )
-        freq_fields = sampling.project(outs[0], freq_band, t)
-
-        # Undo phase changes
-        freq_fields *= jnp.expand_dims(
-            jnp.exp(-1j * phases), axis=range(1, freq_fields.ndim)
-        )
-
-        # Compute error.
-        errs = wave_equation_error(
             fields=freq_fields,
-            freq_band=freq_band,
-            permittivity=permittivity,
-            conductivity=conductivity,
-            source=source,
-            grid=grid,
         )
-        print(f"{errs}, {start_step}, {state.step}, {snapshot_range}")
 
-        if jnp.max(errs) < err_thresh:
-            break
+        return state, (freq_fields, errs, num_steps + snapshot_range.stop)
 
-    return (freq_fields, errs, start_step + steps_per_sim)
+    state, (freq_fields, errs, num_steps) = jax.lax.while_loop(
+        cond_fun=cond_fn,
+        body_fun=body_fn,
+        init_val=(
+            fdtd.State.default(shape),
+            (
+                jnp.zeros((freq_band.num, 3) + shape, dtype=jnp.complex64),
+                jnp.inf * jnp.ones((freq_band.num)),
+                0,
+            ),
+        ),
+    )
+    print(f"{errs}, {num_steps}, {snapshot_range}")
+    return (freq_fields, errs, num_steps)
 
 
 def wave_equation_error(
@@ -325,31 +250,23 @@ def total_sampling_steps(freq_band: Band, sample_every_n: int) -> int:
     return sample_every_n * (2 * freq_band.num - 1)
 
 
-def snapshot_range(
-    start_step: int, steps_per_sim: int, freq_band: Band, sample_every_n: int
-) -> Range:
-    """``Range`` of snapshot times for simulation starting on ``start_step``."""
-    return Range(
-        start=start_step
-        + steps_per_sim
-        - total_sampling_steps(freq_band, sample_every_n),
-        interval=sample_every_n,
-        num=2 * freq_band.num,
-    )
-
-
-def simulation_steps(
+def snapshot_strategy(
     freq_band: Band,
     sample_every_n: int,
     shape: Int3,
-    min_traversals: float = 1.0,
-) -> int:
-    """Suggested length of simulations executed in ``solve()``."""
-    return max(
+    min_traversals: float = 10.0,
+) -> Range:
+    """Suggested length of simulations executed in ``solve()``."""  # TODO: Change.
+    steps_per_sim = max(
         # Number of time steps needed to complete the sampling protocol.
         total_sampling_steps(freq_band, sample_every_n),
         # Allow for ``min_traversals`` bounces along the maximum dimension of
         # the simulation domain, using the crude approximation of traveling a
         # single cell per update step.
         int(min_traversals * max(shape)),
+    )
+    return Range(
+        start=steps_per_sim - (2 * freq_band.num - 1) * sample_every_n - 1,
+        interval=sample_every_n,
+        num=2 * freq_band.num,
     )

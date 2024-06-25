@@ -113,6 +113,15 @@ class Range(NamedTuple):
     interval: int
     num: int
 
+    def __getitem__(self, index: int) -> int:
+        """Value of ``index``-th range value."""
+        return self.start + index * self.interval
+
+    @property
+    def stop(self) -> int:
+        """Range is equivalent to ``range(start, stop, interval)``."""
+        return self.start + (self.num - 1) * self.interval + 1
+
 
 class Volume(NamedTuple):
     """Identifies a volume of size ``shape`` at ``offset`` in space.
