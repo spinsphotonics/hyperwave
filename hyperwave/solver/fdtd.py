@@ -9,22 +9,28 @@ import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 from . import grids, utils
-from .typing import Grid, Int3, Range, Subfield, Volume
+from .typing import Grid, Range, Subfield, Volume
 
 
 class State(NamedTuple):
     """Simulation state for the FDTD method.
 
     Args:
-        step: Time step of the field arrays.
         e_field: ``(3, xx, yy, zz)`` array representing E-field values.
         h_field: ``(3, xx, yy, zz)`` array representing H-field values.
 
     """
 
-    step: int
     e_field: ArrayLike
     h_field: ArrayLike
+
+    # TODO: Change to bfloat16.
+    @staticmethod
+    def default(shape, dtype=jnp.float32) -> State:
+        return State(
+            e_field=jnp.zeros((3,) + shape, dtype=dtype),
+            h_field=jnp.zeros((3,) + shape, dtype=dtype),
+        )
 
 
 # Convenience type alias for simulation outputs.
@@ -109,7 +115,14 @@ def simulate(
 
     """
 
-    # TODO: Do some input verification here?
+    # TODO: Check for compatibility between ``snapshot_range`` and ``(tt,)`` from ``source_waveform``.
+
+    # TODO: Also make sure ``snapshot_range`` is legit.
+
+    shape = utils.problem_shape(grid, permittivity, conductivity, source_field)
+
+    if state is None:
+        state = State.default(shape)
 
     # Precomputed update coefficients
     z = conductivity * dt / (2 * permittivity)
@@ -122,13 +135,13 @@ def simulate(
             -jnp.real(source_field.field * source_waveform[step])
         )
 
-    def step_fn(_, state: State) -> State:
+    def step_fn(step, state: State) -> State:
         """``state`` evolved by one FDTD update."""
-        step, e, h = state
+        e, h = state
         h = h - dt * grids.curl(e, grid, is_forward=True)
 
-        e = ca * e + cb * source_fn(grids.curl(h, grid, is_forward=False), step + 1)
-        return State(step + 1, e, h)
+        e = ca * e + cb * source_fn(grids.curl(h, grid, is_forward=False), step)
+        return State(e, h)
 
     def output_fn(index: int, outs: Outputs, e_field: ArrayLike) -> Outputs:
         """``outs`` updated at ``index`` with ``e_field``."""
@@ -138,35 +151,60 @@ def simulate(
         )
 
     def update_and_output(
-        state: State, outs: Outputs, output_index: int, num_steps: int
+        state: State, outs: Outputs, output_index: int, lower: int, upper: int
     ) -> Tuple[State, Outputs]:
         """``num_steps`` updates on ``state`` with ``output_index`` snapshot."""
         state = jax.lax.fori_loop(
-            lower=0, upper=num_steps, body_fun=step_fn, init_val=state
+            lower=lower, upper=upper, body_fun=step_fn, init_val=state
         )
         outs = output_fn(output_index, outs, state.e_field)
         return state, outs
 
-    # Initialize initial state and outputs.
-    if state is None:
-        state = State(
-            step=-1,
-            e_field=jnp.zeros((3,) + grids.shape(grid)),
-            h_field=jnp.zeros((3,) + grids.shape(grid)),
+    def update_and_output_for_loop_body(
+        output_index: int, state_and_outs: Tuple[State, Outputs]
+    ) -> Tuple[State, Outputs]:
+        """For output indices >= 1"""  # TODO: Improve.
+        return update_and_output(
+            *state_and_outs,
+            output_index,
+            lower=snapshot_range.start
+            + (output_index - 1) * snapshot_range.interval
+            + 1,
+            upper=snapshot_range.start + output_index * snapshot_range.interval + 1,
         )
+
+    # TODO: Remove.
+    # # Initialize initial state and outputs.
+    # if state is None:
+    #     state = State(
+    #         step=-1,
+    #         e_field=jnp.zeros((3,) + grids.shape(grid)),
+    #         h_field=jnp.zeros((3,) + grids.shape(grid)),
+    #     )
 
     outs = tuple(jnp.empty((snapshot_range.num, 3) + ov.shape) for ov in output_volumes)
 
     # Initial update to first output.
     state, outs = update_and_output(
-        state, outs, output_index=0, num_steps=snapshot_range.start - state.step
+        state, outs, output_index=0, lower=0, upper=snapshot_range.start + 1
     )
 
-    # TODO: Jaxify this for-loop as well?
-    # Materialize the rest of the output snapshots.
-    for output_index in range(1, snapshot_range.num):
-        state, outs = update_and_output(
-            state, outs, output_index, num_steps=snapshot_range.interval
-        )
+    # TODO: Change this to ``jax.lax.scan``.
+    state, outs = jax.lax.fori_loop(
+        lower=1,
+        upper=snapshot_range.num,
+        body_fun=update_and_output_for_loop_body,
+        init_val=(state, outs),
+    )
+    # # TODO: Jaxify this for-loop as well?
+    # # Materialize the rest of the output snapshots.
+    # for i in range(1, snapshot_range.num):
+    #     state, outs = update_and_output(
+    #         state,
+    #         outs,
+    #         output_index=i,
+    #         lower=snapshot_range.start + (i - 1) * snapshot_range.interval + 1,
+    #         upper=snapshot_range.start + i * snapshot_range.interval + 1,
+    #     )
 
     return state, outs

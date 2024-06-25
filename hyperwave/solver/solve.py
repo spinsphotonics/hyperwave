@@ -114,7 +114,9 @@ def solve(
 
     # Initial stuff.
     state = fdtd.State(  # TODO: Reconcile with fdtd.simulate() way of doing init state.
-        step=-1, e_field=jnp.zeros((3,) + shape), h_field=jnp.zeros((3,) + shape)
+        # step=-1,
+        e_field=jnp.zeros((3,) + shape),
+        h_field=jnp.zeros((3,) + shape),
     )
     if output_volumes is None:
         output_volumes = [Volume(offset=(0, 0, 0), shape=shape)]
@@ -131,14 +133,16 @@ def solve(
 
     def body_fn(foo):
         start_step, state, _, _ = foo
-        state = fdtd.State(step=-1, e_field=state.e_field, h_field=state.h_field)
+        state = fdtd.State(e_field=state.e_field, h_field=state.h_field)  # step=-1,
 
         phases = -1 * jnp.pi * jnp.arange(freq_band.num)
+
+        # Generate source waveform.
         t = (start_step + 1 + jnp.arange(steps_per_sim)) * dt  # TODO: Fix
         phi = freq_band.values[:, None] * t + phases[:, None]
         wvfrm = jnp.sum(jnp.exp(1j * phi), axis=0)
 
-        # Run simulation.
+        # Advance time-domain fields.
         state, outs = fdtd.simulate(
             dt=dt,
             grid=grid,
@@ -187,7 +191,7 @@ def solve(
     start_step, state, freq_fields, errs = jax.lax.while_loop(
         cond_fn, body_fn, init_foo
     )
-    print(f"{errs}, {start_step}, {state.step}, {snapshot_range}")
+    print(f"{errs}, {start_step}, {snapshot_range}")
     return (freq_fields, errs, start_step)
 
     # TODO: Can we change this into a jax loop?
@@ -349,51 +353,3 @@ def simulation_steps(
         # single cell per update step.
         int(min_traversals * max(shape)),
     )
-
-
-def sim_and_stuff():
-    snapshot_range = Range(
-        start=-1,
-        interval=sample_every_n,
-        num=2 * freq_band.num,
-    )
-    if state is not None:
-        state = fdtd.State(step=-1, e_field=state.e_field, h_field=state.h_field)
-
-    wvfrm = waveform[start_step + 1 :]
-
-    # Run simulation.
-    state, outs = fdtd.simulate(
-        dt=dt,
-        grid=grid,
-        permittivity=permittivity,
-        conductivity=conductivity,
-        source_field=source,
-        source_waveform=wvfrm,  # waveform,
-        output_volumes=output_volumes,
-        snapshot_range=snapshot_range,
-        state=state,
-    )
-
-    # Infer time-harmonic fields.
-    # TODO: Generalize beyond 1st output.
-    t = dt * (
-        0.5 + start_step + snapshot_range.interval * jnp.arange(snapshot_range.num)
-    )
-    freq_fields = sampling.project(outs[0], freq_band, t)
-
-    # Undo phase changes
-    freq_fields *= jnp.expand_dims(
-        jnp.exp(-1j * phases), axis=range(1, freq_fields.ndim)
-    )
-
-    # Compute error.
-    errs = wave_equation_error(
-        fields=freq_fields,
-        freq_band=freq_band,
-        permittivity=permittivity,
-        conductivity=conductivity,
-        source=source,
-        grid=grid,
-    )
-    print(f"{errs}, {start_step}, {state.step}, {snapshot_range}")
