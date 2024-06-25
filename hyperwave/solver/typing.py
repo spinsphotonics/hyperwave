@@ -118,6 +118,10 @@ class Range(NamedTuple):
         return self.start + index * self.interval
 
     @property
+    def values(self) -> jax.Array:
+        return self.start + self.interval * jnp.arange(self.num)
+
+    @property
     def stop(self) -> int:
         """Range is equivalent to ``range(start, stop, interval)``."""
         return self.start + (self.num - 1) * self.interval + 1

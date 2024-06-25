@@ -120,11 +120,6 @@ def solve(
 
         phases = -1 * jnp.pi * jnp.arange(freq_band.num)
 
-        # Generate source waveform.
-        t = (num_steps + jnp.arange(snapshot_range.stop)) * dt  # TODO: Fix
-        phi = freq_band.values[:, None] * t + phases[:, None]
-        wvfrm = jnp.sum(jnp.exp(1j * phi), axis=0)
-
         # Advance time-domain fields.
         state, outs = fdtd.simulate(
             dt=dt,
@@ -132,26 +127,38 @@ def solve(
             permittivity=permittivity,
             conductivity=conductivity,
             source_field=source,
-            source_waveform=wvfrm,  # waveform,
+            source_waveform=source_waveform(
+                t=dt * (num_steps + jnp.arange(snapshot_range.stop)),
+                freq_band=freq_band,
+                is_subfield_source=True,
+            ),
             output_volumes=output_volumes,
             snapshot_range=snapshot_range,
             state=state,
         )
 
-        # Infer time-harmonic fields.
-        # TODO: Connect with the source generation.
-        t = dt * (
-            0.5
-            + num_steps
-            - 1
-            + snapshot_range.interval * jnp.arange(snapshot_range.num)
-        )
-        freq_fields = sampling.project(outs[0], freq_band, t)
+        # # Infer time-harmonic fields.
+        # # TODO: Connect with the source generation.
+        # t = dt * (
+        #     0.5
+        #     + num_steps
+        #     - 1
+        #     + snapshot_range.interval * jnp.arange(snapshot_range.num)
+        # )
+        # freq_fields = sampling.project_fn(freq_band, t)(outs[0])
+        #
+        # # Undo phase changes
+        # freq_fields *= jnp.expand_dims(
+        #     jnp.exp(-1j * phases), axis=range(1, freq_fields.ndim)
+        # )
 
-        # Undo phase changes
-        freq_fields *= jnp.expand_dims(
-            jnp.exp(-1j * phases), axis=range(1, freq_fields.ndim)
+        freq_fields = project_snapshots(
+            outs,
+            t=dt * (num_steps + snapshot_range.values + 0.5),
+            freq_band=freq_band,
+            is_subfield_source=True,
         )
+        freq_fields = freq_fields[0]
 
         # Compute error.
         errs = wave_equation_error(
@@ -223,6 +230,7 @@ def wave_equation_error(
     return norm(err) / norm(src) / jnp.sqrt(3 * shape[0] * shape[1] * shape[2])
 
 
+# TODO: Simplify these three utility functions (into a single one?).
 def sampling_strategy(freq_band: Band, permittivity: ArrayLike) -> Tuple(float, int):
     """``(dt, sample_every_n)`` simulation update/extraction parameters."""
 
@@ -270,3 +278,37 @@ def snapshot_strategy(
         interval=sample_every_n,
         num=2 * freq_band.num,
     )
+
+
+def source_phase(freq_band: Band, is_subfield_source: bool):
+    """Imposed per-frequency-component relative source phase."""
+    if is_subfield_source:
+        # Ensures maximum distance from the point where are frequency components
+        # sum coherently (i.e. pulse peak).
+        return -1 * jnp.pi * jnp.arange(freq_band.num)
+    else:
+        raise NotImplementedError
+
+
+def source_waveform(
+    t: ArrayLike, freq_band: Band, is_subfield_source: bool
+) -> jax.Array:
+    """Complex-valued waveform for time-domain simulation."""
+    phases = source_phase(freq_band, is_subfield_source)
+
+    # ``(ww, tt)`` set of per-frequency waveforms.
+    waveforms = jnp.exp(1j * (freq_band.values[:, None] * t + phases[:, None]))
+
+    # Collapse along the frequency axis.
+    return jnp.sum(waveforms, axis=0)
+
+
+def project_snapshots(
+    snapshots: Tuple[ArrayLike], t: ArrayLike, freq_band: Band, is_subfield_source: bool
+) -> jax.Array:
+    """Complex-valued frequency-domain fields from ``snapshots``."""
+    phases = jnp.expand_dims(
+        source_phase(freq_band, is_subfield_source), axis=range(1, 5)
+    )
+    project_fn = sampling.project_fn(freq_band, t)
+    return tuple(jnp.exp(-1j * phases) * project_fn(s) for s in snapshots)

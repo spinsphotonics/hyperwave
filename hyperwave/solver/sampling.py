@@ -9,8 +9,8 @@ from jax.typing import ArrayLike
 from .typing import Band
 
 
-def project(
-    snapshots: ArrayLike,
+def project_fn(
+    # snapshots: ArrayLike,
     freq_band: Band,
     t: ArrayLike,
 ) -> jax.Array:
@@ -20,8 +20,11 @@ def project(
     P = jnp.concatenate([jnp.cos(wt), -jnp.sin(wt)], axis=1)
 
     # Project out frequency components.
-    res = jnp.einsum("ij,j...->i...", jnp.linalg.inv(P), snapshots)
-    return res[: freq_band.num] + 1j * res[freq_band.num :]
+    def fn(snapshots: ArrayLike) -> jax.Array:
+        res = jnp.einsum("ij,j...->i...", jnp.linalg.inv(P), snapshots)
+        return res[: freq_band.num] + 1j * res[freq_band.num :]
+
+    return fn
 
 
 def sampling_interval(freq_band: Band) -> float:
