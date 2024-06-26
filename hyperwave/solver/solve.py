@@ -1,15 +1,40 @@
+# TODO: Figure out a good heuristic for the default number of transits (min required simulation steps relative to simulation domain size.
+# TODO: Need to pick out the best error value.
 """Solves the wave equation via FDTD simulation."""
 
 from __future__ import annotations
 
-from typing import Sequence, Tuple
+from typing import NamedTuple, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 from . import fdtd, grids, sampling, utils
-from .typing import Band, Grid, Int3, Range, Subfield, Volume
+from .typing import Band, Grid, Range, Subfield, Volume
+
+
+class State(NamedTuple):
+    """State of ``solve()`` computation."""
+
+    simulation_state: fdtd.State
+    errs: ArrayLike
+    num_steps: int
+    solution_fields: Tuple[ArrayLike, ...]
+
+    @staticmethod
+    def default(
+        freq_band: Band, shape: Int3, output_volumes: Sequence[Volume]
+    ) -> State:
+        return State(
+            simulation_state=fdtd.State.default(shape),
+            errs=jnp.inf * jnp.ones((freq_band.num,)),
+            num_steps=0,
+            solution_fields=tuple(
+                jnp.zeros((freq_band.num, 3) + ov.shape, dtype=jnp.complex64)
+                for ov in output_volumes
+            ),
+        )
 
 
 def solve(
@@ -21,6 +46,7 @@ def solve(
     err_thresh: float | None,
     max_steps: int,
     output_volumes: Sequence[Volume] | None = None,
+    min_steps_per_sim: int | None = None,
 ) -> Tuple[jax.Array | Tuple[jax.Array, ...], jax.Array | None, int]:
     r"""Solve the time-harmonic electromagnetic wave equation.
 
@@ -86,6 +112,10 @@ def solve(
         output_volumes: If ``None`` (default), then the solution fields are
           returned in their entirety; otherwise, only sub-volumes of the
           solution field are returned.
+        min_steps_per_sim: Minium number of time-domain updates to execute
+          before attempting to extract solution fields. If ``None`` (default),
+          uses a heuristic value.
+
 
     Returns:
         ``(outs, errs, num_steps)`` where
@@ -93,56 +123,82 @@ def solve(
         * when ``output_volumes=None``, ``outs`` is a ``(ww, 3, xx, yy, zz)``
           array (where ``ww`` is the number of frequencies requested via
           ``freq_band.num``).
+
         * when ``output_volumes`` is a n-tuple of :py:class:`Volume` objects,
           ``outs`` is an n-tuple of ``(ww, 3, xxi, yyi, zzi)`` corresponding to
           the ``shape`` parameters in ``output_volumes``.
-        * ``errs`` is a ``(ww,)`` array at each frequency, or else ``None`` for
-          the case where ``err_thresh=None``.
-        * ``num_steps`` is the number of time-domain updates executed.
+
+        * ``errs`` is a ``(ww,)`` array at each frequency corresponding to
+          the error of ``outs``.
+
+          * if ``jnp.max(errs) <= err_thresh`` (error termination condition
+            reached), ``errs`` corresponds to the error in the solution fields
+            ``outs`` extracted after ``num_steps`` of time-domain updates,
+
+          * if ``jnp.max(errs) > err_thresh`` (error termination condition `not`
+            reached), then ``(outs, errs, num_steps)`` corresponds to the
+            solution field of least error and the number of time-domain updates
+            at which it was reached.
+
+        * ``errs`` is ``None`` for the case where ``err_thresh=None``.
+
+        * ``num_steps`` is the number of time-domain updates executed to obtain
+          ``outs``.
 
     """
+    # TODO: Implement ``err_thresh=None`` case, don't compute error and just simulate to max_steps.
+
+    # Validation and simulation/computation set-up.
     shape = utils.problem_shape(grid, permittivity, conductivity, source)
     dt, sample_every_n = sampling_strategy(freq_band, permittivity)
-    snapshot_range = snapshot_strategy(freq_band, sample_every_n, shape)
-
-    # TODO: Remove.
-    if output_volumes is None:
+    snapshot_range = snapshot_strategy(
+        freq_band,
+        sample_every_n,
+        min_steps_per_sim=(  # TODO: Tune according to simulation efficiency for small number of updates.
+            max(shape) if min_steps_per_sim is None else min_steps_per_sim
+        ),
+    )
+    if output_volumes is None:  # Return entire solution field.
         output_volumes = [Volume(offset=(0, 0, 0), shape=shape)]
+    elif err_thresh is not None:  # Entire solution field needed for error computation.
+        output_volumes = [Volume(offset=(0, 0, 0), shape=shape)] + output_volumes
 
-    def cond_fn(state_and_result):
+    def cond_fn(curr_and_best_state: Tuple[State, State]) -> bool:
         """Terminate on either error or iteration thresholds."""
-        _, (_, errs, num_steps) = state_and_result
-        return jnp.logical_and(jnp.max(errs) > err_thresh, num_steps < max_steps)
+        curr_state, _ = curr_and_best_state
 
-    def body_fn(state_and_result):
+        return jnp.logical_and(
+            jnp.max(curr_state.errs) > err_thresh, curr_state.num_steps < max_steps
+        )
+
+    def body_fn(curr_and_best_state: Tuple[State, State]) -> Tuple[State, State]:
         """Run simulation and extract time-harmonic fields."""
-        state, (_, _, num_steps) = state_and_result
+        curr_state, best_state = curr_and_best_state
 
         # Advance time-domain fields.
-        state, outs = fdtd.simulate(
+        simulation_state, outs = fdtd.simulate(
             dt=dt,
             grid=grid,
             permittivity=permittivity,
             conductivity=conductivity,
             source_field=source,
             source_waveform=source_waveform(
-                t=dt * (num_steps + jnp.arange(snapshot_range.stop)),
+                t=dt * (curr_state.num_steps + jnp.arange(snapshot_range.stop)),
                 freq_band=freq_band,
                 is_subfield_source=True,
             ),
             output_volumes=output_volumes,
             snapshot_range=snapshot_range,
-            state=state,
+            state=curr_state.simulation_state,
         )
 
         # Back out the frequency-domain fields.
-        freq_fields = project_snapshots(
+        solution_fields = project_snapshots(
             outs,
-            t=dt * (num_steps + snapshot_range.values + 0.5),
+            t=dt * (curr_state.num_steps + snapshot_range.values + 0.5),
             freq_band=freq_band,
             is_subfield_source=True,
         )
-        freq_fields = freq_fields[0]  # TODO: Remove.
 
         # Compute error.
         errs = wave_equation_error(
@@ -151,25 +207,34 @@ def solve(
             permittivity=permittivity,
             conductivity=conductivity,
             source=source,
-            fields=freq_fields,
+            fields=solution_fields[0],
         )
 
-        return state, (freq_fields, errs, num_steps + snapshot_range.stop)
+        # Trim the initial (full) solution field if not requested.
+        if len(output_volumes) > 1:
+            solution_fields = solution_fields[1:]
 
-    state, (freq_fields, errs, num_steps) = jax.lax.while_loop(
+        # Update current state.
+        curr_state = State(
+            simulation_state=simulation_state,
+            errs=errs,
+            num_steps=curr_state.num_steps + snapshot_range.stop,
+            solution_fields=solution_fields,
+        )
+        return curr_state, select_state(curr_state, best_state)
+
+    _, best_state = jax.lax.while_loop(
         cond_fun=cond_fn,
         body_fun=body_fn,
         init_val=(
-            fdtd.State.default(shape),
-            (
-                jnp.zeros((freq_band.num, 3) + shape, dtype=jnp.complex64),
-                jnp.inf * jnp.ones((freq_band.num)),
-                0,
-            ),
+            State.default(freq_band, shape, output_volumes),
+            State.default(freq_band, shape, output_volumes),
         ),
     )
-    print(f"{errs}, {num_steps}, {snapshot_range}")
-    return (freq_fields, errs, num_steps)
+    print(
+        f"{best_state.errs}, {best_state.num_steps}, {snapshot_range}"
+    )  # TODO: Remove.
+    return (best_state.solution_fields, best_state.errs, best_state.num_steps)
 
 
 def wave_equation_error(
@@ -237,19 +302,13 @@ def sampling_strategy(freq_band: Band, permittivity: ArrayLike) -> Tuple(float, 
 
 
 def snapshot_strategy(
-    freq_band: Band,
-    sample_every_n: int,
-    shape: Int3,
-    min_traversals: float = 100.0,  # TODO: Not happy with this...
+    freq_band: Band, sample_every_n: int, min_steps_per_sim: int
 ) -> Range:
     """Suggested length of simulations executed in ``solve()``."""  # TODO: Change.
     steps_per_sim = max(
         # Number of time steps needed to complete the sampling protocol.
         sample_every_n * (2 * freq_band.num - 1),
-        # Allow for ``min_traversals`` bounces along the maximum dimension of
-        # the simulation domain, using the crude approximation of traveling a
-        # single cell per update step.
-        int(min_traversals * max(shape)),
+        min_steps_per_sim,
     )
     return Range(
         start=steps_per_sim - (2 * freq_band.num - 1) * sample_every_n - 1,
@@ -290,3 +349,12 @@ def project_snapshots(
     )
     project_fn = sampling.project_fn(freq_band, t)
     return tuple(jnp.exp(-1j * phases) * project_fn(s) for s in snapshots)
+
+
+def select_state(a: State, b: State) -> State:
+    """Return the state with the best maximum error."""
+
+    def map_fn(u, v):
+        return jax.lax.select(jnp.less_equal(jnp.max(a.errs), jnp.max(b.errs)), u, v)
+
+    return jax.tree.map(map_fn, a, b)

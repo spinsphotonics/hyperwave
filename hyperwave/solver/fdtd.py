@@ -1,3 +1,4 @@
+# TODO: Change to bfloat16.
 """Implementation of the FDTD method. """
 
 from __future__ import annotations
@@ -24,7 +25,6 @@ class State(NamedTuple):
     e_field: ArrayLike
     h_field: ArrayLike
 
-    # TODO: Change to bfloat16.
     @staticmethod
     def default(shape, dtype=jnp.float32) -> State:
         return State(
@@ -87,7 +87,6 @@ def simulate(
     This pure-JAX, feature-minimal implementation of the FDTD method also serves
     to identify the minimum set of features that subsequent simulation engines
     will require in order to serve the :py:func:`solve` API.
-
 
     Args:
         dt: Dimensionless value of the amount of time advanced per FDTD update.
