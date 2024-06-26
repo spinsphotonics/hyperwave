@@ -11,11 +11,6 @@ from jax.typing import ArrayLike
 from . import fdtd, grids, sampling, utils
 from .typing import Band, Grid, Int3, Range, Subfield, Volume
 
-# TODO: Need to support the following use cases.
-# - exploratory: try hard to reduce error, find minimal
-# - direct-with-error: I'm pretty sure I know how many steps are needed, just do that?
-# - direct-with-no-error: Don't compute error.
-
 
 def solve(
     grid: Grid,
@@ -67,7 +62,7 @@ def solve(
     :math:`(1 / \sqrt{n}) \cdot \lVert \nabla \times \nabla \times E - \omega^2 \epsilon E - i \omega J \rVert / \lVert \omega J \rVert`
     where :math:`n` is the number of elements in the solution field :math:`E`.
 
-    For very large simulations (possibly over many frequencies), we may not
+    For some simulations (e.g. large domain, many frequencies), we may not
     want to store the entirety of the solution fields. In these cases, the
     error computation can be elided and we can choose to return only the desired
     subdomains of the output fields.
@@ -123,8 +118,6 @@ def solve(
         """Run simulation and extract time-harmonic fields."""
         state, (_, _, num_steps) = state_and_result
 
-        phases = -1 * jnp.pi * jnp.arange(freq_band.num)
-
         # Advance time-domain fields.
         state, outs = fdtd.simulate(
             dt=dt,
@@ -142,28 +135,14 @@ def solve(
             state=state,
         )
 
-        # # Infer time-harmonic fields.
-        # # TODO: Connect with the source generation.
-        # t = dt * (
-        #     0.5
-        #     + num_steps
-        #     - 1
-        #     + snapshot_range.interval * jnp.arange(snapshot_range.num)
-        # )
-        # freq_fields = sampling.project_fn(freq_band, t)(outs[0])
-        #
-        # # Undo phase changes
-        # freq_fields *= jnp.expand_dims(
-        #     jnp.exp(-1j * phases), axis=range(1, freq_fields.ndim)
-        # )
-
+        # Back out the frequency-domain fields.
         freq_fields = project_snapshots(
             outs,
             t=dt * (num_steps + snapshot_range.values + 0.5),
             freq_band=freq_band,
             is_subfield_source=True,
         )
-        freq_fields = freq_fields[0]
+        freq_fields = freq_fields[0]  # TODO: Remove.
 
         # Compute error.
         errs = wave_equation_error(
@@ -235,7 +214,6 @@ def wave_equation_error(
     return norm(err) / norm(src) / jnp.sqrt(3 * shape[0] * shape[1] * shape[2])
 
 
-# TODO: Simplify these three utility functions (into a single one?).
 def sampling_strategy(freq_band: Band, permittivity: ArrayLike) -> Tuple(float, int):
     """``(dt, sample_every_n)`` simulation update/extraction parameters."""
 
@@ -258,21 +236,16 @@ def sampling_strategy(freq_band: Band, permittivity: ArrayLike) -> Tuple(float, 
     return dt, sample_every_n
 
 
-def total_sampling_steps(freq_band: Band, sample_every_n: int) -> int:
-    """Total number of simulation updates needed to complete sampling."""
-    return sample_every_n * (2 * freq_band.num - 1)
-
-
 def snapshot_strategy(
     freq_band: Band,
     sample_every_n: int,
     shape: Int3,
-    min_traversals: float = 100.0,
+    min_traversals: float = 100.0,  # TODO: Not happy with this...
 ) -> Range:
     """Suggested length of simulations executed in ``solve()``."""  # TODO: Change.
     steps_per_sim = max(
         # Number of time steps needed to complete the sampling protocol.
-        total_sampling_steps(freq_band, sample_every_n),
+        sample_every_n * (2 * freq_band.num - 1),
         # Allow for ``min_traversals`` bounces along the maximum dimension of
         # the simulation domain, using the crude approximation of traveling a
         # single cell per update step.
