@@ -146,30 +146,38 @@ def solve(
           ``outs``.
 
     """
-    # TODO: Implement ``err_thresh=None`` case, don't compute error and just simulate to max_steps.
-
-    # Validation and simulation/computation set-up.
+    # Validation.
     shape = utils.problem_shape(grid, permittivity, conductivity, source)
+
+    # Decide on how to use the underlying time-domain simulation.
+    if err_thresh is None:
+        min_steps_per_sim = max_steps
+    elif min_steps_per_sim is None:
+        # TODO: Tune according to simulation efficiency for small number of updates.
+        min_steps_per_sim = max(shape)
     dt, sample_every_n = sampling_strategy(freq_band, permittivity)
-    snapshot_range = snapshot_strategy(
-        freq_band,
-        sample_every_n,
-        min_steps_per_sim=(  # TODO: Tune according to simulation efficiency for small number of updates.
-            max(shape) if min_steps_per_sim is None else min_steps_per_sim
-        ),
-    )
+    snapshot_range = snapshot_strategy(freq_band, sample_every_n, min_steps_per_sim)
+
+    # Include the entire solution field as an output as long as ``err_thresh`` is not ``None``.
     if output_volumes is None:  # Return entire solution field.
-        output_volumes = [Volume(offset=(0, 0, 0), shape=shape)]
+        effective_output_volumes = [Volume(offset=(0, 0, 0), shape=shape)]
     elif err_thresh is not None:  # Entire solution field needed for error computation.
-        output_volumes = [Volume(offset=(0, 0, 0), shape=shape)] + output_volumes
+        effective_output_volumes = [
+            Volume(offset=(0, 0, 0), shape=shape)
+        ] + output_volumes
+    else:
+        effective_output_volumes = output_volumes
 
     def cond_fn(curr_and_best_state: Tuple[State, State]) -> bool:
         """Terminate on either error or iteration thresholds."""
         curr_state, _ = curr_and_best_state
 
-        return jnp.logical_and(
-            jnp.max(curr_state.errs) > err_thresh, curr_state.num_steps < max_steps
-        )
+        if err_thresh is None:
+            return curr_state.num_steps < max_steps
+        else:
+            return jnp.logical_and(
+                jnp.max(curr_state.errs) > err_thresh, curr_state.num_steps < max_steps
+            )
 
     def body_fn(curr_and_best_state: Tuple[State, State]) -> Tuple[State, State]:
         """Run simulation and extract time-harmonic fields."""
@@ -187,7 +195,7 @@ def solve(
                 freq_band=freq_band,
                 is_subfield_source=True,
             ),
-            output_volumes=output_volumes,
+            output_volumes=effective_output_volumes,
             snapshot_range=snapshot_range,
             state=curr_state.simulation_state,
         )
@@ -200,19 +208,18 @@ def solve(
             is_subfield_source=True,
         )
 
-        # Compute error.
-        errs = wave_equation_error(
-            grid=grid,
-            freq_band=freq_band,
-            permittivity=permittivity,
-            conductivity=conductivity,
-            source=source,
-            fields=solution_fields[0],
-        )
-
-        # Trim the initial (full) solution field if not requested.
-        if len(output_volumes) > 1:
-            solution_fields = solution_fields[1:]
+        if err_thresh is None:
+            errs = curr_state.errs
+        else:
+            # Compute error.
+            errs = wave_equation_error(
+                grid=grid,
+                freq_band=freq_band,
+                permittivity=permittivity,
+                conductivity=conductivity,
+                source=source,
+                fields=solution_fields[0],
+            )
 
         # Update current state.
         curr_state = State(
@@ -227,14 +234,25 @@ def solve(
         cond_fun=cond_fn,
         body_fun=body_fn,
         init_val=(
-            State.default(freq_band, shape, output_volumes),
-            State.default(freq_band, shape, output_volumes),
+            State.default(freq_band, shape, effective_output_volumes),
+            State.default(freq_band, shape, effective_output_volumes),
         ),
     )
-    print(
-        f"{best_state.errs}, {best_state.num_steps}, {snapshot_range}"
-    )  # TODO: Remove.
-    return (best_state.solution_fields, best_state.errs, best_state.num_steps)
+
+    if output_volumes is None:
+        # Return the solution field directly (i.e. not a tuple of fields).
+        solution_fields = best_state.solution_fields[0]
+    elif err_thresh is not None:
+        # Trim the artifically added full solution field.
+        solution_fields = best_state.solution_fields[1:]
+    else:
+        solution_fields = best_state.solution_fields
+
+    return (
+        solution_fields,
+        None if err_thresh is None else best_state.errs,
+        int(best_state.num_steps),
+    )
 
 
 def wave_equation_error(
@@ -311,9 +329,9 @@ def snapshot_strategy(
         min_steps_per_sim,
     )
     return Range(
-        start=steps_per_sim - (2 * freq_band.num - 1) * sample_every_n - 1,
-        interval=sample_every_n,
-        num=2 * freq_band.num,
+        start=int(steps_per_sim - (2 * freq_band.num - 1) * sample_every_n - 1),
+        interval=int(sample_every_n),
+        num=int(2 * freq_band.num),
     )
 
 
