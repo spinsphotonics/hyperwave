@@ -1,7 +1,9 @@
+from functools import partial
 from typing import Callable, NamedTuple, Tuple
 
 import jax
 import jax.numpy as jnp
+from jax.scipy.sparse.linalg import bicgstab
 from jax.typing import ArrayLike
 
 
@@ -12,7 +14,7 @@ class FreqBand(NamedTuple):
 
     @property
     def values(self):
-        return jnp.linshape(self.start, self.end, self.num)[:, None, None, None, None]
+        return jnp.linspace(self.start, self.end, self.num)[:, None, None, None, None]
 
 
 class Domain(NamedTuple):
@@ -23,66 +25,85 @@ class Domain(NamedTuple):
 
     @property
     def shape(self):
-        return (freq_band.num,) + permittivity.shape
+        return (self.freq_band.num,) + self.permittivity.shape
+
+    def operator(self, x, freq_index=None):
+        w = self.freq_band.values
+        if freq_index is not None:
+            w = w[freq_index]
+
+        curl_fwd, curl_bwd = tuple(
+            partial(_curl, grid=self.grid, is_forward=f) for f in (True, False)
+        )
+
+        return (
+            curl_fwd(curl_bwd(x))
+            - (w**2) * (self.permittivity - 1j * self.conductivity / w) * x
+        )
 
 
 class Source(NamedTuple):
     values: ArrayLike
     offset: Tuple[int, int, int]
 
+    def full(self, domain: Domain):
+        src = -1j * domain.freq_band.values * self.values
+        return (
+            jnp.zeros(domain.shape, dtype=src.dtype)
+            .at[
+                :,
+                :,
+                self.offset[-3] : self.offset[-3] + self.values.shape[-3],
+                self.offset[-2] : self.offset[-2] + self.values.shape[-2],
+                self.offset[-1] : self.offset[-1] + self.values.shape[-1],
+            ]
+            .set(src)
+        )
 
-def field(
+
+def field_solve(
     domain: Domain,
     source: Source,
     init_field: ArrayLike | None = None,
     tol: float = 1e-3,
-    maxiter: int | None = None,
+    max_iters: int | None = None,
 ) -> jax.Array:
-    # TODO: Do we need to ravel here? Maybe not!
-    op, b = wave_equation_op(
-        grid, freq_band, permittivity, conductivity, source, source_offset
-    )
 
-    curl_fwd, curl_bwd = tuple(
-        partial(_curl, domain.grid, is_forward=f) for f in (True, False)
-    )
+    # def operator(w, x):
+    #     return (
+    #         curl_fwd(curl_bwd(x))
+    #         - (w**2) * (domain.permittivity - 1j * domain.conductivity / w) * x
+    #     )
 
-    def operator(w, x):
-        return (
-            curl_fwd(curl_bwd(x))
-            - (w**2) * (domain.permittivity - 1j * domain.conductivity / w) * x
-        )
-
-    # Expand source across the whole domain.
-    source = -1j * w * source
-    source = (
-        jnp.zeros(domain.shape, source.dtype)
-        .at[
-            ...,
-            source_offset[-2] : source_offset[-2] + source.shape[-2],
-            source_offset[-1] : source_offset[-1] + source.shape[-1],
-            source_offset[-0] : source_offset[-0] + source.shape[-0],
-        ]
-        .set(source)
-    )
+    # # Expand source across the whole domain.
+    # src = -1j * domain.freq_band.values * source.values
+    # src = (
+    #     jnp.zeros(domain.shape, dtype=src.dtype)
+    #     .at[
+    #         :,
+    #         :,
+    #         source.offset[-2] : source.offset[-2] + source.values.shape[-2],
+    #         source.offset[-1] : source.offset[-1] + source.values.shape[-1],
+    #         source.offset[-0] : source.offset[-0] + source.values.shape[-0],
+    #     ]
+    #     .set(src)
+    # )
 
     if init_field is None:
-        init_field = jnp.zeros_like(source)
+        init_field = jnp.zeros_like(source.full(domain))
 
-    def solve(A, b, x0):
-        field, _ = bicgstab(
-            A=partial(operator, w=w),
-            b=b[i],
-            x0=init_field[i],
-            tol=tol,
-            max_iter=max_iter,
-        )
+    def solve(op, b, x0):
+        field, _ = bicgstab(A=op, b=b, x0=x0, tol=tol, maxiter=max_iters)
         return field
 
     return jnp.stack(
         [
-            solve(partial(operator, w=wi), source[i], init_field[i])
-            for i, wi in enumerate(w)
+            solve(
+                partial(domain.operator, freq_index=i),
+                source.full(domain)[i],
+                init_field[i],
+            )
+            for i in range(domain.freq_band.num)
         ]
     )
 
@@ -118,5 +139,5 @@ def _spatial_diff(
     # Take the forward- or backward-difference which either reach ahead or
     # behind, respectively, one grid cell.
     if is_forward:
-        return (jnp.roll(field, shift=-1, axis=axis) - field) / grid[axis]
-    return (field - jnp.roll(field, shift=+1, axis=axis)) / grid[axis]
+        return (jnp.roll(field, shift=-1, axis=axis) - field) / delta[axis]
+    return (field - jnp.roll(field, shift=+1, axis=axis)) / delta[axis]
