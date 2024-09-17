@@ -23,7 +23,7 @@ class Source(NamedTuple):
     values: ArrayLike
     offset: Int3
 
-    def full(self, domain):
+    def full_values(self, domain):
         src = -1j * domain.freq_band.values * self.values
         return (
             jnp.zeros(domain.shape, dtype=src.dtype)
@@ -36,6 +36,17 @@ class Source(NamedTuple):
             ]
             .set(src)
         )
+
+    @classmethod
+    def from_mode(mode: ArrayLike, offset: Int3, axis: int):
+        values = (jnp.zeros_like(mode[:, 0]), mode[:, 0], mode[:, 1])
+        return Source(
+            values=jnp.stack([values[(axis + i) % 3] for i in range(3)], axis=1),
+            offset=offset,
+        )
+
+    def to_mode(self, axis: int):
+        return self.values[:, tuple((axis + i) % 3 for i in range(1, 3))]
 
 
 class Domain(NamedTuple):
@@ -81,43 +92,13 @@ class Domain(NamedTuple):
             return (jnp.roll(x, shift=-1, axis=axis) - x) / delta[axis]
         return (x - jnp.roll(x, shift=+1, axis=axis)) / delta[axis]
 
-    def mode_operator(self, x, axis: int):
-        subdomain = self._subdomain(x.offset, x.values.shape)
-        axis_inds = tuple((axis + d) % 3 for d in range(1, 3))
-        mode_field = x.values[:, axis_inds, ...]
-        mode_field = subdomain._mode_operator_impl(mode_field, axis)
-        values = (
-            jnp.zeros_like(x.values)
-            .at[:, axis_inds + (axis,), ...]
-            .set(jnp.concat([mode_fields, jnp.zeros_like(mode_fields)[:, 0]]))
-        )
-        return Source(values=values, offset=x.offset)
+    def mode_operator(self, x: ArrayLike, offset: Int3, shape: Int3, axis: int):
+        subdomain = self._subdomain(offset, shape)
 
-    # def mode_operator(self, x: ArrayLike, offset: Int3, shape: Int3, axis: int):
-    #     return self._subdomain(offset, shape)._mode_operator_impl(x, axis)
-
-    def _subdomain(self, offset: Int3, shape: Int3):
-        return Domain(
-            grid=tuple(g[u0 : u0 + uu] for g, u0, uu in (self.grid, offset, shape)),
-            freq_band=self.freq_band,
-            permittivity=self._subvolume(self.permittivity, offset, shape),
-            conductivity=self._subvolume(self.conductivity, offset, shape),
-        )
-
-    @classmethod
-    def _subvolume(u: ArrayLike, offset: Int3, shape: Int3) -> ArrayLike:
-        return u[
-            ...,
-            offset[-3] : offset[-3] + shape[-3],
-            offset[-2] : offset[-2] + shape[-2],
-            offset[-1] : offset[-1] + shape[-1],
-        ]
-
-    def _mode_operator_impl(self, x: ArrayLike, axis: int):
         dfi, dbi, dfj, dbj = [
             partial(
                 _spatial_diff,
-                delta=self.grid[(axis + axis_shift) % 3],
+                delta=subdomain.grid[(axis + axis_shift) % 3],
                 axis=((axis + axis_shift) % 3) - 3,
                 is_forward=is_forward,
             )
@@ -150,9 +131,26 @@ class Domain(NamedTuple):
             return _concat([dbi(u), dbj(u)])
 
         omega = (freq_band.start + freq_band.stop) / 2
-        ei, ej, ek = tuple(self.permittivity[(i + 1) % 3] for i in range(3))
+        ei, ej, ek = tuple(subdomain.permittivity[(i + 1) % 3] for i in range(3))
         eji = jnp.stack([ej, ei], axis=0)
         return omega**2 * eji * x + eji * curl_to_ij(curl_to_k(x) / ek) + grad(div(x))
+
+    def _subdomain(self, offset: Int3, shape: Int3):
+        return Domain(
+            grid=tuple(g[u0 : u0 + uu] for g, u0, uu in (self.grid, offset, shape)),
+            freq_band=self.freq_band,
+            permittivity=self._subvolume(self.permittivity, offset, shape),
+            conductivity=self._subvolume(self.conductivity, offset, shape),
+        )
+
+    @classmethod
+    def _subvolume(u: ArrayLike, offset: Int3, shape: Int3) -> ArrayLike:
+        return u[
+            ...,
+            offset[-3] : offset[-3] + shape[-3],
+            offset[-2] : offset[-2] + shape[-2],
+            offset[-1] : offset[-1] + shape[-1],
+        ]
 
 
 def field_solve(
@@ -164,7 +162,7 @@ def field_solve(
 ) -> jax.Array:
 
     if init_field is None:
-        init_field = jnp.zeros_like(source.full(domain))
+        init_field = jnp.zeros_like(source.full_values(domain))
 
     def solve(op, b, x0):
         field, _ = bicgstab(A=op, b=b, x0=x0, tol=tol, maxiter=max_iters)
@@ -174,7 +172,7 @@ def field_solve(
         [
             solve(
                 partial(domain.wave_operator, freq_index=i),
-                source.full(domain)[i],
+                source.full_values(domain)[i],
                 init_field[i],
             )
             for i in range(domain.freq_band.num)
@@ -182,29 +180,39 @@ def field_solve(
     )
 
 
-# TODO: need to figure out stuff?
+def field_error(domain: Domain, source: Source, field: ArrayLike):
+    src = source.full_values(domain)
+    return _norm_by_freq(domain.wave_operator(field) - src) / _norm_by_freq(src)
+
+
 def mode_solve(
     domain: Domain, offset: Int3, shape: Int3, mode_num: int, axis: int
-) -> jax.Array:
+) -> Tuple[jax.Array, jax.Array]:
     # field_shape = tuple(d.shape[0] for d in grid.du)
     # shape = (2 * prod(field_shape), num_modes)
     field_shape = (2,) + shape + (mode_num + 1,)
 
-    # TODO: The problem here is that we need to remove the longitudinal axis.
-    # For this reason we should just use a separate "mode field" and have
-    # some way to convert this to a Source object.
     def op(x):
-        src = Source(values=jnp.reshape(x, field_shape), offset=offset)
-        src = domain.mode_operator(src, axis)
-        return jnp.reshape(src.values, (-1, field_shape[-1]))
+        return jnp.reshape(
+            domain.mode_operator(jnp.reshape(x, field_shape), axis),
+            (-1, field_shape[-1]),
+        )
 
     # TODO: Not sure about this...
     x0 = jax.random.normal(jax.random.PRNGKey(random_seed), field_shape)
 
-    # betas_squared, x, _ = lobpcg_standard(op, jnp.reshape(x0, (-1, field_shape[-1])))
+    # TODO: Need to modify so that we solve for indiv. frequencies.
+    betas_squared, x, _ = lobpcg_standard(op, jnp.reshape(x0, (-1, field_shape[-1])))
+    return (
+        Source.from_mode(jnp.reshape(x, field_shape)[..., -1], offset, axis),
+        jnp.sqrt(betas_squared)[..., -1],
+    )
 
-    return jnp.reshape(x, field_shape)[..., -1]
-    # errs = jnp.linalg.norm(op(x) - betas_squared * u, axis=0)
-    modes = jnp.reshape(u.T, (-1, 2) + field_shape)
-    betas = jnp.sqrt(betas_squared)
-    return modes, betas, errs
+
+def mode_error(domain: Domain, source: Source, wavevectors: ArrayLike, axis: int):
+    lx = jnp.square(wavevectors) * x
+    return _norm_by_freq(domain.mode_operator(x, axis) - lx) / _norm_by_freq(x)
+
+
+def _norm_by_freq(x: ArrayLike):
+    return jnp.linalg.norm(jnp.reshape(x, (x.shape[0], -1)), axis=-1)
