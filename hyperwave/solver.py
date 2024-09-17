@@ -180,10 +180,11 @@ def field_solve(
 
     return jnp.stack(
         [
-            solve(
-                partial(domain.wave_operator, freq_index=i),
-                source.full_term(domain)[i],
-                init_field[i],
+            jax.lax.custom_linear_solve(
+                matvec=partial(domain.wave_operator, freq_index=i),
+                b=source.full_term(domain)[i],
+                solve=partial(solve, x0=init_field[i]),
+                symmetric=True,
             )
             for i in range(domain.freq_band.num)
         ]
