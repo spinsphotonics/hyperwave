@@ -1,0 +1,26 @@
+[build-system]
+requires = ["flit_core>=3.4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "hyperwave"
+version = "0.0.1"
+authors = [
+  { name="Jesse Lu", email="jesselu@spinsphotonics.com" },
+]
+description = "Photonics simulation and design."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "jax",
+    "numpy",
+]
+
+[project.urls]
+Homepage = "https://github.com/spinsphotonics/hyperwave"
+Issues = "https://github.com/spinsphotonics/hyperwave/issues"
